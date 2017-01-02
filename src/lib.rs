@@ -6,7 +6,8 @@ extern crate crossbeam;
 use std::thread;
 
 // use std::sync::{Arc, Mutex};
-use std::sync::Arc;
+use std::sync::{self, Arc, Mutex};
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering};
 use crossbeam::sync::MsQueue;
 use std::path::{Path, PathBuf};
@@ -22,22 +23,19 @@ enum Message {
 
 #[derive(Debug)]
 struct Work {
-    depth: u32,
-    path: PathBuf,
-    parent: Option<Arc<DirStats>>,
+    stats: Arc<Mutex<DirStats>>,
 }
 
 // From riggrep/ignore/src/walk.rs
 
 #[derive(Debug)]
 struct DirStats {
+    depth: u32,
     path: PathBuf,
-    bytes: AtomicU64,
-    child_dirs: AtomicU64,
-    parent: Option<Arc<DirStats>>,
-
-    // children: Vec<DirStats>,
-    // parent_weak: Weak:
+    bytes: Cell<u64>,
+    // child_dirs: AtomicU64,
+    children: RefCell<Vec<Arc<Mutex<DirStats>>>>,
+    // parent_weak: RefCell<Option<sync::Weak<DirStats>>>,
 }
 
 impl DirStats {
@@ -46,9 +44,6 @@ impl DirStats {
     //     Ok(fs::read_dir(&self.path)?)
     // }
 
-    fn print(&self) {
-        println!("{:?}: {}", self.path, self.bytes.load(Ordering::SeqCst));
-    }
 }
 
 struct Worker {
@@ -60,10 +55,6 @@ struct Worker {
     num_waiting: Arc<AtomicUsize>,
     num_quitting: Arc<AtomicUsize>,
     threads: usize,
-}
-
-fn print(path: &Path, bytes: u64) {
-    println!("{:?}: {}", path, bytes);
 }
 
 impl Worker {
@@ -80,49 +71,25 @@ impl Worker {
 
     fn run_one(&mut self, work: Work) -> io::Result<()> {
         let mut bytes = 0;
-        let mut child_dirs = vec![];
-        for result in work.path.read_dir()? {
+        let stats = work.stats.lock().unwrap();
+        for result in stats.path.read_dir()? {
             let dent = result?;
             let metadata = dent.metadata()?;
             if metadata.is_file() {
                 bytes += metadata.len();
             } else if metadata.is_dir() {
-                child_dirs.push(dent.path());
-            }
-        }
-        if !child_dirs.is_empty() {
-            let current = Arc::new(DirStats {
-                path: work.path.clone(),
-                bytes: AtomicU64::new(bytes),
-                child_dirs: AtomicU64::new(child_dirs.len() as u64),
-                parent: work.parent.clone(),
-            });
-            for d in child_dirs {
-                self.queue.push(Message::Work(Work {
-                    depth: work.depth + 1,
-                    path: d,
-                    parent: Some(current.clone()),
+                let s = Arc::new(Mutex::new(DirStats {
+                    depth: stats.depth + 1,
+                    path: PathBuf::from(dent.path()),
+                    bytes: Cell::new(0),
+                    children: RefCell::new(vec![]),
                 }));
+                stats.children.borrow_mut().push(s.clone());
+                self.queue.push(Message::Work(Work { stats: s }));
             }
-        } else {
-            print(&work.path, bytes);
         }
 
-        let mut work = work;
-
-        // TODO: Recursivly print parent.
-        let mut cur = &mut work.parent.as_mut();
-        // let mut cur = &mut work.parent;
-
-        while let Some(ref mut parent) = *cur {
-            parent.bytes.fetch_add(bytes, Ordering::SeqCst);
-            if parent.child_dirs.fetch_sub(1, Ordering::SeqCst) != 1 {
-                break;
-            }
-            parent.print();
-            bytes = parent.bytes.load(Ordering::SeqCst);
-            // cur = &mut parent.parent.as_mut();
-        }
+        stats.bytes.set(bytes);
         Ok(())
     }
 
@@ -227,17 +194,36 @@ impl Worker {
     }
 }
 
+fn print(dir: Arc<Mutex<DirStats>>) -> u64 {
+    let stats = dir.lock().unwrap();
+    let mut bytes = 0;
+    // TODO: Use into_inner()?
+    for d in stats.children.borrow().iter() {
+        bytes += print(d.clone());
+    }
+    let total = stats.bytes.get() + bytes;
+    println!("{:?}: {}", stats.path, total);
+    total
+}
+
 pub fn run(dir: &str) {
     // TODO: use num_cpus
     let threads = 4;
 
     let queue = Arc::new(MsQueue::new());
 
-    queue.push(Message::Work(Work {
+    let cur = Arc::new(Mutex::new(DirStats {
         depth: 0,
         path: PathBuf::from(dir),
-        parent: None,
+        bytes: Cell::new(0),
+        children: RefCell::new(vec![]),
     }));
+
+    let work = Work {
+        stats: cur.clone(),
+    };
+
+    queue.push(Message::Work(work));
     let num_waiting = Arc::new(AtomicUsize::new(0));
     let num_quitting = Arc::new(AtomicUsize::new(0));
     let quit_now = Arc::new(AtomicBool::new(false));
@@ -259,6 +245,7 @@ pub fn run(dir: &str) {
     for handle in handles {
         handle.join().unwrap();
     }
+    print(cur);
 }
 
 
