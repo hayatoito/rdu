@@ -1,10 +1,13 @@
 [package]
 authors = ["Hayato Ito <hayato@google.com>"]
+edition = "2018"
+license = "MIT"
 name = "rdu"
 version = "0.1.0"
-
 [dependencies]
-clap = "2.19.3"
-crossbeam = "0.2.10"
-log = "0.3.6"
-loggerv = "0.2.0"
+clap = "2.32.0"
+crossbeam = "0.6.0"
+log = "0.4.6"
+loggerv = "0.7.1"
+num_cpus = "1.9.0"
+rayon = "1.0.3"
